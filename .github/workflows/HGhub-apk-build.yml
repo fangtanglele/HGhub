@@ -1,13 +1,11 @@
-# 放到你 fork 的 .github/workflows/HGhub-apk-build.yml（v2：容错 + 自诊断）
+# 放到你 fork 的 .github/workflows/HGhub-apk-build.yml（v4）
 #
-# 用法：Actions -> 左侧 "HGhub Android APK (self-build)" -> Run workflow
-#       -> 底部 Artifacts 下载 HGhub-apk.zip -> 解压得到 HGhub_0.0.1_arm64.apk
-#
-# v2 相对 v1 的改动（针对 v1 在 2 分半就 exit 1 的情况）：
-#   1. pnpm install 去掉 --frozen-lockfile（仓库 lockfile 与 package.json 可能已不同步）
-#   2. SDK/NDK 逐个包安装并打印结果，某个包失败不会让整步无提示地挂掉
-#   3. 增加 "Diagnostics" 步骤，把 java/node/pnpm/rust/sdk 版本全打出来
-#   4. 增加 pnpm tauri info，直接暴露 SDK/NDK/Java 探测结果
+# v4 修的两个真实报错（来自 v3 的构建日志）：
+#   A. rquickjs-sys 的 bindgen 报 "Unversioned target triples are not supported!"
+#      —— NDK r27+ 的 sys/cdefs.h 拒绝无 API 级别的三元组。
+#      修法：给 bindgen 追加 --target=aarch64-linux-android24（会定义 __ANDROID_API__）。
+#   B. 指定的 NDK 28.2 没装上，Gradle 只能用镜像自带的 NDK 30。
+#      修法：不再硬编码 NDK 版本，改为「探测实际安装的 NDK」，并把 gradle 的 ndkVersion 对齐到它。
 name: HGhub Android APK (self-build)
 
 on:
@@ -18,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NDK_VERSION: "28.2.13676358"
+  ANDROID_API: "24"          # 与 tauri.conf.json 的 minSdkVersion 一致
   KEY_ALIAS: "hghub"
   KS_PASS: "hghub-selfbuild"
 
@@ -31,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rquickjs-sys 会用 bindgen 生成绑定，需要 libclang；缺失时 rustc 报 exit 101
+      # rquickjs-sys 用 bindgen 生成绑定，需要 libclang
       - name: Install native build helpers
         run: |
           sudo apt-get update -qq
@@ -52,37 +50,42 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set Android env
-        run: |
-          set -eu
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-          echo "Detected SDK: $SDK"
-          ls "$SDK" || true
-
-      - name: Install Android SDK packages (tolerant)
+      - name: Install Android SDK packages
         run: |
           set -u
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKM" ]; then echo "::error::sdkmanager not found at $SDKM"; exit 1; fi
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          for pkg in \
-            "platform-tools" \
-            "platforms;android-35" \
-            "platforms;android-36" \
-            "build-tools;35.0.0" \
-            "build-tools;36.0.0" \
-            "ndk;$NDK_VERSION"
-          do
-            echo "=== installing $pkg ==="
-            if "$SDKM" --install "$pkg"; then echo "OK: $pkg"; else echo "::warning::FAILED to install $pkg"; fi
+          for pkg in "platform-tools" "platforms;android-35" "platforms;android-36" \
+                     "build-tools;35.0.0" "build-tools;36.0.0"; do
+            echo "=== $pkg ==="
+            "$SDKM" --install "$pkg" >/dev/null && echo "OK: $pkg" || echo "::warning::FAILED $pkg"
           done
-          echo "=== installed ==="
-          ls "$SDK/platforms" "$SDK/build-tools" 2>/dev/null || true
-          ls "$SDK/ndk" 2>/dev/null || true
+
+      # 关键修复 B：探测真实 NDK，而不是假设某个版本存在
+      - name: Detect NDK + set bindgen clang args
+        run: |
+          set -eu
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "${NDK:-}" ]; then
+            echo "镜像没有 NDK，尝试安装 28.2"
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" || true
+            NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          if [ -z "${NDK:-}" ]; then echo "::error::仍然没有 NDK"; exit 1; fi
+
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK_VERSION_DETECTED=$(basename "$NDK")" >> "$GITHUB_ENV"
+          # 关键修复 A：带 API 级别的三元组 + NDK sysroot，否则 sys/cdefs.h 直接 #error
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-linux-android${ANDROID_API} -I$SYSROOT/usr/include -I$SYSROOT/usr/include/aarch64-linux-android" >> "$GITHUB_ENV"
+          echo "使用 NDK: $NDK"
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E '^aarch64.*clang$' | head -20 || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,11 +100,10 @@ jobs:
         run: |
           set +e
           echo "--- node/pnpm ---"; node -v; pnpm -v
-          echo "--- java ---"; java -version 2>&1; echo "JAVA_HOME=$JAVA_HOME"
-          echo "--- rust ---"; rustc -vV; cargo -V
-          echo "--- android ---"; echo "SDK=$ANDROID_HOME NDK=$NDK_HOME"
-          ls "$ANDROID_HOME/ndk" 2>/dev/null
-          echo "--- npmrc / workspace ---"; cat .npmrc 2>/dev/null; cat pnpm-workspace.yaml 2>/dev/null
+          echo "--- java ---"; java -version 2>&1
+          echo "--- rust ---"; rustc -vV
+          echo "--- android ---"; echo "SDK=$ANDROID_HOME"; echo "NDK=$NDK_HOME"; echo "NDK_VER=$NDK_VERSION_DETECTED"
+          echo "--- bindgen ---"; echo "$BINDGEN_EXTRA_CLANG_ARGS"
 
       - name: Install JS deps
         run: pnpm install --no-frozen-lockfile
@@ -109,19 +111,19 @@ jobs:
       - name: Show tauri environment
         run: pnpm tauri info || true
 
-      - name: Init Android project (gen/android 未提交，必须先 init)
+      - name: Init Android project
         run: pnpm tauri android init --ci
 
-      - name: Align NDK version in generated gradle
+      - name: Align ndkVersion in generated gradle
         run: |
           set -u
           f=src-tauri/gen/android/app/build.gradle.kts
           if [ -f "$f" ]; then
-            echo "--- before ---"; grep -n 'ndkVersion\|compileSdk' "$f" || true
-            sed -i "s/ndkVersion = \"[^\"]*\"/ndkVersion = \"$NDK_VERSION\"/" "$f" || true
-            echo "--- after ----"; grep -n 'ndkVersion' "$f" || true
+            echo "--- before ---"; grep -n 'ndkVersion' "$f" || true
+            sed -i "s/ndkVersion = \"[^\"]*\"/ndkVersion = \"$NDK_VERSION_DETECTED\"/" "$f" || true
+            echo "--- after ---"; grep -n 'ndkVersion' "$f" || true
           else
-            echo "::warning::$f 不存在，init 可能没成功"
+            echo "::warning::$f 不存在"
           fi
 
       - name: Build unsigned release APK
@@ -132,7 +134,7 @@ jobs:
           {
             echo "### cargo/android build exit code: ${rc}"
             echo '```text'
-            grep -nE "error(\[|:)|^error|failed to|linking with|undefined reference|cannot find|note: " build.log | head -80
+            grep -nE "error(\[|:)|^error|failed to|linking with|undefined reference|cannot find|Unable to generate|note: " build.log | head -100
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$rc" -ne 0 ]; then echo "::error::build failed with exit code $rc"; fi
