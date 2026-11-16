@@ -1,0 +1,127 @@
+# 放到你 fork 的 .github/workflows/HGhub-apk-build.yml
+#
+# 用法：Actions -> 左侧 "HGhub Android APK (self-build)" -> Run workflow
+#       -> 底部 Artifacts 下载 HGhub-apk.zip -> 解压得到 HGhub_0.0.1_arm64.apk
+#
+# 路线：release 未签名构建 + keytool 生成临时签名密钥 + zipalign + apksigner 签名
+#      （与上游 release.yml 的 android job 同一套命令，只是不需要维护者的签名 secret）
+#
+# 产物为 arm64 (aarch64) 单个 APK，覆盖所有现代安卓手机，可直接安装（需允许未知来源）。
+name: HGhub Android APK (self-build)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: "28.2.13676358"
+  KEY_ALIAS: "hghub"
+  KS_PASS: "hghub-selfbuild"   # 仅用于你自己这台手机的临时密钥，不是上游发布密钥
+
+jobs:
+  apk:
+    name: Build arm64 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ubuntu runner 自带 SDK；不用 android-actions/setup-android（它的 license 交互会卡住）
+      - name: Install Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install \
+            "platform-tools" \
+            "platforms;android-35" "platforms;android-36" \
+            "build-tools;35.0.0" "build-tools;36.0.0" \
+            "ndk;$NDK_VERSION"
+          ls "$SDK/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-apk
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Init Android project (gen/android 未提交，必须先 init)
+        run: pnpm tauri android init --ci
+
+      # 若 init 生成的 gradle 里 ndkVersion 与已装版本不一致，Gradle 会去联网下载（很容易卡死/失败）
+      - name: Align NDK version in generated gradle
+        run: |
+          set -euo pipefail
+          f=src-tauri/gen/android/app/build.gradle.kts
+          echo "--- before ---"; grep -n 'ndkVersion\|compileSdk' "$f" || true
+          sed -i "s/ndkVersion = \"[^\"]*\"/ndkVersion = \"$NDK_VERSION\"/" "$f" || true
+          echo "--- after ----"; grep -n 'ndkVersion' "$f" || true
+
+      - name: Build unsigned release APK
+        run: pnpm tauri android build --apk --target aarch64
+
+      - name: Sign APK (self-build keystore)
+        run: |
+          set -euo pipefail
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          echo "using build-tools $BT"
+          KS="$RUNNER_TEMP/selfbuild.keystore"
+          keytool -genkeypair -v -keystore "$KS" -alias "$KEY_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KS_PASS" -keypass "$KS_PASS" \
+            -dname "CN=HGhub Self Build, O=Self, C=CN"
+
+          mkdir -p out
+          n=0
+          while IFS= read -r f; do
+            base="$(basename "$(dirname "$f")")"        # 例如 arm64
+            raw="out/HGhub_0.0.1_${base}_raw.apk"
+            aligned="out/HGhub_0.0.1_${base}.apk"
+            cp "$f" "$raw"
+            "$ANDROID_SDK_ROOT/build-tools/$BT/zipalign" -p -f 4 "$raw" "$aligned"
+            rm -f "$raw"
+            "$ANDROID_SDK_ROOT/build-tools/$BT/apksigner" sign \
+              --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+              --v4-signing-enabled false --out "$aligned.tmp" "$aligned"
+            mv "$aligned.tmp" "$aligned"
+            "$ANDROID_SDK_ROOT/build-tools/$BT/apksigner" verify --print-certs "$aligned" | head -5
+            n=$((n+1))
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -path '*release*' -name '*.apk')
+          rm -f "$KS"
+          [ "$n" -gt 0 ] || { echo "::error::没有找到 release APK"; exit 1; }
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-apk
+          path: out/*.apk
+          if-no-files-found: error
