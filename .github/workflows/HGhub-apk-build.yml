@@ -1,12 +1,13 @@
-# 放到你 fork 的 .github/workflows/HGhub-apk-build.yml
+# 放到你 fork 的 .github/workflows/HGhub-apk-build.yml（v2：容错 + 自诊断）
 #
 # 用法：Actions -> 左侧 "HGhub Android APK (self-build)" -> Run workflow
 #       -> 底部 Artifacts 下载 HGhub-apk.zip -> 解压得到 HGhub_0.0.1_arm64.apk
 #
-# 路线：release 未签名构建 + keytool 生成临时签名密钥 + zipalign + apksigner 签名
-#      （与上游 release.yml 的 android job 同一套命令，只是不需要维护者的签名 secret）
-#
-# 产物为 arm64 (aarch64) 单个 APK，覆盖所有现代安卓手机，可直接安装（需允许未知来源）。
+# v2 相对 v1 的改动（针对 v1 在 2 分半就 exit 1 的情况）：
+#   1. pnpm install 去掉 --frozen-lockfile（仓库 lockfile 与 package.json 可能已不同步）
+#   2. SDK/NDK 逐个包安装并打印结果，某个包失败不会让整步无提示地挂掉
+#   3. 增加 "Diagnostics" 步骤，把 java/node/pnpm/rust/sdk 版本全打出来
+#   4. 增加 pnpm tauri info，直接暴露 SDK/NDK/Java 探测结果
 name: HGhub Android APK (self-build)
 
 on:
@@ -19,7 +20,7 @@ concurrency:
 env:
   NDK_VERSION: "28.2.13676358"
   KEY_ALIAS: "hghub"
-  KS_PASS: "hghub-selfbuild"   # 仅用于你自己这台手机的临时密钥，不是上游发布密钥
+  KS_PASS: "hghub-selfbuild"
 
 jobs:
   apk:
@@ -29,6 +30,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # rquickjs-sys 会用 bindgen 生成绑定，需要 libclang；缺失时 rustc 报 exit 101
+      - name: Install native build helpers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev llvm pkg-config
+          clang --version | head -1
 
       - uses: pnpm/action-setup@v4
         with:
@@ -44,22 +52,37 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # ubuntu runner 自带 SDK；不用 android-actions/setup-android（它的 license 交互会卡住）
-      - name: Install Android SDK / NDK
+      - name: Set Android env
         run: |
-          set -euo pipefail
+          set -eu
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "Detected SDK: $SDK"
+          ls "$SDK" || true
+
+      - name: Install Android SDK packages (tolerant)
+        run: |
+          set -u
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then echo "::error::sdkmanager not found at $SDKM"; exit 1; fi
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          "$SDKM" --install \
+          for pkg in \
             "platform-tools" \
-            "platforms;android-35" "platforms;android-36" \
-            "build-tools;35.0.0" "build-tools;36.0.0" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0" \
             "ndk;$NDK_VERSION"
-          ls "$SDK/ndk"
+          do
+            echo "=== installing $pkg ==="
+            if "$SDKM" --install "$pkg"; then echo "OK: $pkg"; else echo "::warning::FAILED to install $pkg"; fi
+          done
+          echo "=== installed ==="
+          ls "$SDK/platforms" "$SDK/build-tools" 2>/dev/null || true
+          ls "$SDK/ndk" 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,23 +93,58 @@ jobs:
           workspaces: src-tauri -> target
           key: android-apk
 
+      - name: Diagnostics
+        run: |
+          set +e
+          echo "--- node/pnpm ---"; node -v; pnpm -v
+          echo "--- java ---"; java -version 2>&1; echo "JAVA_HOME=$JAVA_HOME"
+          echo "--- rust ---"; rustc -vV; cargo -V
+          echo "--- android ---"; echo "SDK=$ANDROID_HOME NDK=$NDK_HOME"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null
+          echo "--- npmrc / workspace ---"; cat .npmrc 2>/dev/null; cat pnpm-workspace.yaml 2>/dev/null
+
       - name: Install JS deps
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Show tauri environment
+        run: pnpm tauri info || true
 
       - name: Init Android project (gen/android 未提交，必须先 init)
         run: pnpm tauri android init --ci
 
-      # 若 init 生成的 gradle 里 ndkVersion 与已装版本不一致，Gradle 会去联网下载（很容易卡死/失败）
       - name: Align NDK version in generated gradle
         run: |
-          set -euo pipefail
+          set -u
           f=src-tauri/gen/android/app/build.gradle.kts
-          echo "--- before ---"; grep -n 'ndkVersion\|compileSdk' "$f" || true
-          sed -i "s/ndkVersion = \"[^\"]*\"/ndkVersion = \"$NDK_VERSION\"/" "$f" || true
-          echo "--- after ----"; grep -n 'ndkVersion' "$f" || true
+          if [ -f "$f" ]; then
+            echo "--- before ---"; grep -n 'ndkVersion\|compileSdk' "$f" || true
+            sed -i "s/ndkVersion = \"[^\"]*\"/ndkVersion = \"$NDK_VERSION\"/" "$f" || true
+            echo "--- after ----"; grep -n 'ndkVersion' "$f" || true
+          else
+            echo "::warning::$f 不存在，init 可能没成功"
+          fi
 
       - name: Build unsigned release APK
-        run: pnpm tauri android build --apk --target aarch64
+        run: |
+          set +e
+          pnpm tauri android build --apk --target aarch64 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### cargo/android build exit code: ${rc}"
+            echo '```text'
+            grep -nE "error(\[|:)|^error|failed to|linking with|undefined reference|cannot find|note: " build.log | head -80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then echo "::error::build failed with exit code $rc"; fi
+          exit "$rc"
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Sign APK (self-build keystore)
         run: |
@@ -98,11 +156,10 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass "$KS_PASS" -keypass "$KS_PASS" \
             -dname "CN=HGhub Self Build, O=Self, C=CN"
-
           mkdir -p out
           n=0
           while IFS= read -r f; do
-            base="$(basename "$(dirname "$f")")"        # 例如 arm64
+            base="$(basename "$(dirname "$f")")"
             raw="out/HGhub_0.0.1_${base}_raw.apk"
             aligned="out/HGhub_0.0.1_${base}.apk"
             cp "$f" "$raw"
